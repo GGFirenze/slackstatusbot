@@ -7,7 +7,7 @@ from slack_bolt.adapter.socket_mode import SocketModeHandler
 from slack_sdk import WebClient
 from dotenv import load_dotenv
 
-from config import OWNER_USER_ID, DEFAULT_AWAY_MESSAGE, REPLY_TEMPLATE, COOLDOWN_SECONDS
+from config import OWNER_USER_ID, REPLY_TEMPLATE, FALLBACK_STATUS, COOLDOWN_SECONDS
 
 load_dotenv()
 
@@ -16,15 +16,27 @@ logger = logging.getLogger("ooo-bot")
 
 app = App(token=os.environ["SLACK_BOT_TOKEN"])
 
-# User token client — used to post replies in the original DM conversation
+# User token client — posts replies in the original DM conversation
 user_client = WebClient(token=os.environ["SLACK_USER_TOKEN"])
 
 # Bot state
 _active: bool = False
-_custom_message: str = DEFAULT_AWAY_MESSAGE
 
 # {sender_user_id: last_reply_unix_timestamp}
 _cooldowns: dict[str, float] = {}
+
+
+def get_owner_profile(client) -> tuple[str, str]:
+    """Fetch the owner's first name and current status text."""
+    try:
+        resp = client.users_profile_get(user=OWNER_USER_ID)
+        profile = resp.get("profile", {})
+        first_name = profile.get("first_name") or profile.get("real_name", "")
+        status_text = profile.get("status_text", "") or FALLBACK_STATUS
+        return first_name, status_text
+    except Exception:
+        logger.exception("Failed to fetch owner profile")
+        return "", FALLBACK_STATUS
 
 
 def is_on_cooldown(sender_id: str) -> bool:
@@ -36,20 +48,23 @@ def is_on_cooldown(sender_id: str) -> bool:
 
 @app.command("/ooo-on")
 def handle_ooo_on(ack, respond, command):
-    global _active, _custom_message, _cooldowns
+    global _active, _cooldowns
     ack()
 
     if command.get("user_id") != OWNER_USER_ID:
-        respond("Sorry, only GG can control this bot.")
+        respond("Sorry, only the bot owner can control this.")
         return
 
     _active = True
     _cooldowns = {}
-    custom = command.get("text", "").strip()
-    _custom_message = custom if custom else DEFAULT_AWAY_MESSAGE
 
-    respond(f"Auto-reply *activated*.\nMessage: _{_custom_message}_")
-    logger.info("OoO activated with message: %s", _custom_message)
+    first_name, status_text = get_owner_profile(app.client)
+    respond(
+        f"Auto-reply *activated*.\n"
+        f"Your current status: _{status_text}_\n"
+        f"Replies will use your name: _{first_name}_"
+    )
+    logger.info("OoO activated")
 
 
 @app.command("/ooo-off")
@@ -58,7 +73,7 @@ def handle_ooo_off(ack, respond, command):
     ack()
 
     if command.get("user_id") != OWNER_USER_ID:
-        respond("Sorry, only GG can control this bot.")
+        respond("Sorry, only the bot owner can control this.")
         return
 
     _active = False
@@ -87,14 +102,13 @@ def handle_message(event, client):
         logger.debug("Skipping %s (on cooldown)", sender_id)
         return
 
-    reply = REPLY_TEMPLATE.format(message=_custom_message)
+    first_name, status_text = get_owner_profile(client)
+    reply = REPLY_TEMPLATE.format(first_name=first_name, status_text=status_text)
 
     try:
-        # Post in the original DM using the user token so the reply
-        # appears in the same conversation, from User 1's profile.
         user_client.chat_postMessage(channel=event["channel"], text=reply)
         _cooldowns[sender_id] = time.time()
-        logger.info("Auto-replied to %s", sender_id)
+        logger.info("Auto-replied to %s (status: %s)", sender_id, status_text)
     except Exception:
         logger.exception("Failed to send auto-reply to %s", sender_id)
 
@@ -104,7 +118,6 @@ if __name__ == "__main__":
         raise SystemExit("OWNER_USER_ID is not set. Add it to your .env file.")
 
     logger.info("Starting OoO bot for user %s", OWNER_USER_ID)
-    logger.info("Default away message: %s", DEFAULT_AWAY_MESSAGE)
     logger.info("Cooldown: %s seconds", COOLDOWN_SECONDS)
 
     handler = SocketModeHandler(app, os.environ["SLACK_APP_TOKEN"])
